@@ -1,0 +1,198 @@
+# .github/workflows/wordpress-deploy.yml
+name: 'WordPress Deploy'
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: string
+      php-version:
+        description: 'PHP version for linting'
+        required: false
+        type: string
+        default: '8.2'
+      config-file:
+        description: 'Path to wp-deploy-config.yml'
+        required: false
+        type: string
+        default: 'wp-deploy-config.yml'
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      SSH_HOST:
+        required: false
+      SSH_PORT:
+        required: false
+      SSH_USER:
+        required: false
+      WP_CONTENT_PATH:
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+
+jobs:
+  lint:
+    name: 'Lint'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          coverage: none
+          tools: composer
+
+      - name: Install PHPCS & WPCS
+        run: |
+          if [ -f "composer.json" ]; then
+            composer install --no-interaction --prefer-dist
+          else
+            composer init --no-interaction --name="yoko/lint"
+            composer config allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+            composer require --dev squizlabs/php_codesniffer:"^3.8" wp-coding-standards/wpcs:"^3.0"
+          fi
+
+      - name: Run PHPCS
+        run: |
+          if [ -f "phpcs.xml" ]; then
+            ./vendor/bin/phpcs .
+          else
+            ./vendor/bin/phpcs --standard=WordPress-Core .
+          fi
+
+  deploy:
+    name: 'Deploy'
+    needs: [lint]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      slack_channel: ${{ steps.config.outputs.slack_channel }}
+      slack_username: ${{ steps.config.outputs.slack_username }}
+      slack_icon: ${{ steps.config.outputs.slack_icon }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          sudo chmod +x /usr/bin/yq
+
+      - name: Parse Configuration
+        id: config
+        run: |
+          CONFIG="${{ inputs.config-file }}"
+          if [ ! -f "$CONFIG" ]; then
+            echo "::error::Config file $CONFIG not found!"
+            exit 1
+          fi
+
+          TYPE=$(yq '.project.type' "$CONFIG")
+          SLUG=$(yq '.project.slug' "$CONFIG")
+          DEFAULT_HOST=$(yq '.project.host' "$CONFIG")
+          
+          SLACK_CHANNEL=$(yq '.slack.channel' "$CONFIG")
+          SLACK_USERNAME=$(yq '.slack.username' "$CONFIG")
+          SLACK_ICON=$(yq '.slack.icon_emoji' "$CONFIG")
+          
+          HOST_TYPE="${{ vars.HOST_TYPE }}"
+          if [ -z "$HOST_TYPE" ]; then
+            HOST_TYPE="$DEFAULT_HOST"
+          fi
+
+          case $TYPE in
+            theme) SUBDIR="themes" ;;
+            plugin) SUBDIR="plugins" ;;
+            mu-plugin) SUBDIR="mu-plugins" ;;
+            *) SUBDIR="themes" ;;
+          esac
+
+          echo "host_type=$HOST_TYPE" >> $GITHUB_OUTPUT
+          echo "subdir=$SUBDIR" >> $GITHUB_OUTPUT
+          echo "slug=$SLUG" >> $GITHUB_OUTPUT
+          echo "slack_channel=$SLACK_CHANNEL" >> $GITHUB_OUTPUT
+          echo "slack_username=$SLACK_USERNAME" >> $GITHUB_OUTPUT
+          echo "slack_icon=$SLACK_ICON" >> $GITHUB_OUTPUT
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
+          echo "" >> ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -v -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }} ${{ vars.SSH_HOST || secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          
+          echo "Checking key validity..."
+          ssh-keygen -l -f ~/.ssh/id_rsa || echo "ERROR: Invalid Private Key Format"
+
+      - name: Test SSH Connection
+        run: |
+          ssh -v -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }} ${{ vars.SSH_USER || secrets.SSH_USER }}@${{ vars.SSH_HOST || secrets.SSH_HOST }} "echo Connection Successful"
+
+      - name: Deploy via Rsync
+        run: |
+          EXCLUDES=(
+            --exclude='.git*' --exclude='.github*' --exclude='node_modules'
+            --exclude='vendor' --exclude='wp-deploy-config.yml' --exclude='phpcs.xml'
+            --exclude='.editorconfig' --exclude='.zencoder' --exclude='.cursor'
+          )
+          
+          IFS=$'\n'
+          for item in $(yq '.excludes[]' "${{ inputs.config-file }}"); do
+            EXCLUDES+=(--exclude="$item")
+          done
+          unset IFS
+
+          BASE_PATH="${{ vars.WP_CONTENT_PATH || secrets.WP_CONTENT_PATH }}"
+          if [ -z "$BASE_PATH" ]; then
+            echo "::error::WP_CONTENT_PATH is not defined!"
+            exit 1
+          fi
+
+          if [[ "$BASE_PATH" == *"wp-content" ]]; then
+            DESTINATION="${BASE_PATH}/${{ steps.config.outputs.subdir }}/${{ steps.config.outputs.slug }}/"
+          else
+            DESTINATION="${BASE_PATH}/wp-content/${{ steps.config.outputs.subdir }}/${{ steps.config.outputs.slug }}/"
+          fi
+
+          echo "DEBUG: Deploying to ${DESTINATION}"
+
+          rsync -vrlpt --delete --delete-excluded --blocking-io \
+            -e "ssh -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }}" \
+            "${EXCLUDES[@]}" \
+            ./ "${{ vars.SSH_USER || secrets.SSH_USER }}@${{ vars.SSH_HOST || secrets.SSH_HOST }}:${DESTINATION}"
+
+      - name: Cache Clearing
+        run: |
+          HOST_TYPE="${{ steps.config.outputs.host_type }}"
+          SSH_CMD="ssh -q -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }} ${{ vars.SSH_USER || secrets.SSH_USER }}@${{ vars.SSH_HOST || secrets.SSH_HOST }}"
+          
+          case $HOST_TYPE in
+            kinsta) $SSH_CMD "wp kinsta cache purge" || true ;;
+            wpengine) $SSH_CMD "wp engine cache flush" || true ;;
+            pressable) $SSH_CMD "wp pressable cache purge" || true ;;
+            *) $SSH_CMD "wp cache flush" || true ;;
+          esac
+
+  notify:
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Slack Notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: ${{ needs.deploy.outputs.slack_channel || 'deployments' }}
+          SLACK_COLOR: ${{ needs.deploy.result == 'success' && 'good' || 'danger' }}
+          SLACK_MESSAGE: "Deployment of ${{ github.repository }} to ${{ github.ref_name }} was a ${{ needs.deploy.result }}."
+          SLACK_TITLE: "Deployment Status"
+          SLACK_USERNAME: ${{ needs.deploy.outputs.slack_username || 'DeployBot' }}
+          SLACK_ICON_EMOJI: ${{ needs.deploy.outputs.slack_icon || ':rocket:' }}
+        if: ${{ secrets.SLACK_WEBHOOK != '' }}
