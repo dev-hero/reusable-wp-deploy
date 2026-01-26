@@ -19,7 +19,7 @@ on:
         default: 'wp-deploy-config.yml'
     secrets:
       SSH_PRIVATE_KEY:
-        required: true
+        required: false
       SSH_HOST:
         required: false
       SSH_PORT:
