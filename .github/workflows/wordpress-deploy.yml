@@ -1,4 +1,3 @@
-# .github/workflows/wordpress-deploy.yml
 name: 'WordPress Deploy'
 
 on:
@@ -51,7 +50,7 @@ jobs:
           if [ -f "composer.json" ]; then
             composer install --no-interaction --prefer-dist
           else
-            composer init --no-interaction --name="yoko/lint"
+            composer init --no-interaction --name="temp/lint"
             composer config allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
             composer require --dev squizlabs/php_codesniffer:"^3.8" wp-coding-standards/wpcs:"^3.0"
           fi
@@ -61,7 +60,7 @@ jobs:
           if [ -f "phpcs.xml" ]; then
             ./vendor/bin/phpcs .
           else
-            ./vendor/bin/phpcs --standard=WordPress-Core .
+            ./vendor/bin/phpcs --standard=WordPress-Core --extensions=php --ignore=vendor .
           fi
 
   deploy:
@@ -80,7 +79,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
-          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          sudo wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
           sudo chmod +x /usr/bin/yq
 
       - name: Parse Configuration
@@ -94,22 +93,28 @@ jobs:
 
           TYPE=$(yq '.project.type' "$CONFIG")
           SLUG=$(yq '.project.slug' "$CONFIG")
-          DEFAULT_HOST=$(yq '.project.host' "$CONFIG")
-          
-          SLACK_CHANNEL=$(yq '.slack.channel' "$CONFIG")
-          SLACK_USERNAME=$(yq '.slack.username' "$CONFIG")
-          SLACK_ICON=$(yq '.slack.icon_emoji' "$CONFIG")
-          
+          DEFAULT_HOST=$(yq '.project.host // "generic"' "$CONFIG")
+
+          # Slack Settings (with defaults)
+          SLACK_CHANNEL=$(yq '.slack.channel // "deployments"' "$CONFIG")
+          SLACK_USERNAME=$(yq '.slack.username // "DeployBot"' "$CONFIG")
+          SLACK_ICON=$(yq '.slack.icon_emoji // ":rocket:"' "$CONFIG")
+
+          # Allow environment variable override for host type
           HOST_TYPE="${{ vars.HOST_TYPE }}"
-          if [ -z "$HOST_TYPE" ]; then
+          if [ -z "$HOST_TYPE" ] || [ "$HOST_TYPE" == "null" ]; then
             HOST_TYPE="$DEFAULT_HOST"
           fi
 
+          # Determine subdirectory based on project type
           case $TYPE in
             theme) SUBDIR="themes" ;;
             plugin) SUBDIR="plugins" ;;
             mu-plugin) SUBDIR="mu-plugins" ;;
-            *) SUBDIR="themes" ;;
+            *)
+              echo "::warning::Unknown project type '$TYPE', defaulting to themes"
+              SUBDIR="themes"
+              ;;
           esac
 
           echo "host_type=$HOST_TYPE" >> $GITHUB_OUTPUT
@@ -119,80 +124,166 @@ jobs:
           echo "slack_username=$SLACK_USERNAME" >> $GITHUB_OUTPUT
           echo "slack_icon=$SLACK_ICON" >> $GITHUB_OUTPUT
 
+          # Debug output
+          echo "::notice::Deploying $TYPE '$SLUG' to $HOST_TYPE host"
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
           echo "" >> ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -v -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }} ${{ vars.SSH_HOST || secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-          
-          echo "Checking key validity..."
-          ssh-keygen -l -f ~/.ssh/id_rsa || echo "ERROR: Invalid Private Key Format"
+
+          SSH_PORT="${{ vars.SSH_PORT || secrets.SSH_PORT }}"
+          SSH_PORT="${SSH_PORT:-22}"
+          SSH_HOST="${{ vars.SSH_HOST || secrets.SSH_HOST }}"
+
+          if [ -z "$SSH_HOST" ]; then
+            echo "::error::SSH_HOST is not defined!"
+            exit 1
+          fi
+
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          echo "Validating SSH key..."
+          if ! ssh-keygen -l -f ~/.ssh/id_rsa > /dev/null 2>&1; then
+            echo "::error::Invalid SSH private key format"
+            exit 1
+          fi
+          echo "::notice::SSH key validated successfully"
 
       - name: Test SSH Connection
         run: |
-          ssh -v -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }} ${{ vars.SSH_USER || secrets.SSH_USER }}@${{ vars.SSH_HOST || secrets.SSH_HOST }} "echo Connection Successful"
+          SSH_PORT="${{ vars.SSH_PORT || secrets.SSH_PORT }}"
+          SSH_PORT="${SSH_PORT:-22}"
+          SSH_USER="${{ vars.SSH_USER || secrets.SSH_USER }}"
+          SSH_HOST="${{ vars.SSH_HOST || secrets.SSH_HOST }}"
+
+          if [ -z "$SSH_USER" ]; then
+            echo "::error::SSH_USER is not defined!"
+            exit 1
+          fi
+
+          echo "Testing connection to $SSH_HOST..."
+          ssh -o ConnectTimeout=30 -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "echo 'Connection successful'"
 
       - name: Deploy via Rsync
         run: |
+          # Default excludes
           EXCLUDES=(
-            --exclude='.git*' --exclude='.github*' --exclude='node_modules'
-            --exclude='vendor' --exclude='wp-deploy-config.yml' --exclude='phpcs.xml'
-            --exclude='.editorconfig' --exclude='.zencoder' --exclude='.cursor'
+            --exclude='.git*'
+            --exclude='.github*'
+            --exclude='node_modules'
+            --exclude='vendor'
+            --exclude='wp-deploy-config.yml'
+            --exclude='phpcs.xml'
+            --exclude='phpcs.xml.dist'
+            --exclude='.editorconfig'
+            --exclude='.zencoder'
+            --exclude='.cursor'
+            --exclude='.vscode'
+            --exclude='.idea'
+            --exclude='composer.json'
+            --exclude='composer.lock'
           )
-          
-          IFS=$'\n'
-          for item in $(yq '.excludes[]' "${{ inputs.config-file }}"); do
-            EXCLUDES+=(--exclude="$item")
-          done
-          unset IFS
 
+          # Add custom excludes from config
+          CONFIG="${{ inputs.config-file }}"
+          if [ -f "$CONFIG" ]; then
+            while IFS= read -r item; do
+              if [ -n "$item" ] && [ "$item" != "null" ]; then
+                EXCLUDES+=(--exclude="$item")
+              fi
+            done < <(yq '.excludes[]' "$CONFIG" 2>/dev/null || true)
+          fi
+
+          # Build destination path
           BASE_PATH="${{ vars.WP_CONTENT_PATH || secrets.WP_CONTENT_PATH }}"
           if [ -z "$BASE_PATH" ]; then
             echo "::error::WP_CONTENT_PATH is not defined!"
             exit 1
           fi
 
-          if [[ "$BASE_PATH" == *"wp-content" ]]; then
-            DESTINATION="${BASE_PATH}/${{ steps.config.outputs.subdir }}/${{ steps.config.outputs.slug }}/"
+          SUBDIR="${{ steps.config.outputs.subdir }}"
+          SLUG="${{ steps.config.outputs.slug }}"
+
+          if [[ "$BASE_PATH" == *"wp-content"* ]]; then
+            DESTINATION="${BASE_PATH}/${SUBDIR}/${SLUG}/"
           else
-            DESTINATION="${BASE_PATH}/wp-content/${{ steps.config.outputs.subdir }}/${{ steps.config.outputs.slug }}/"
+            DESTINATION="${BASE_PATH}/wp-content/${SUBDIR}/${SLUG}/"
           fi
 
-          echo "DEBUG: Deploying to ${DESTINATION}"
+          # SSH connection details
+          SSH_PORT="${{ vars.SSH_PORT || secrets.SSH_PORT }}"
+          SSH_PORT="${SSH_PORT:-22}"
+          SSH_USER="${{ vars.SSH_USER || secrets.SSH_USER }}"
+          SSH_HOST="${{ vars.SSH_HOST || secrets.SSH_HOST }}"
 
+          echo "::notice::Deploying to ${SSH_HOST}:${DESTINATION}"
+
+          # Deploy with rsync
           rsync -vrlpt --delete --delete-excluded --blocking-io \
-            -e "ssh -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }}" \
+            -e "ssh -p ${SSH_PORT}" \
             "${EXCLUDES[@]}" \
-            ./ "${{ vars.SSH_USER || secrets.SSH_USER }}@${{ vars.SSH_HOST || secrets.SSH_HOST }}:${DESTINATION}"
+            ./ "${SSH_USER}@${SSH_HOST}:${DESTINATION}"
 
-      - name: Cache Clearing
+          echo "::notice::Deployment completed successfully"
+
+      - name: Clear Cache
+        continue-on-error: true
         run: |
           HOST_TYPE="${{ steps.config.outputs.host_type }}"
-          SSH_CMD="ssh -q -p ${{ vars.SSH_PORT || secrets.SSH_PORT || 22 }} ${{ vars.SSH_USER || secrets.SSH_USER }}@${{ vars.SSH_HOST || secrets.SSH_HOST }}"
-          
+          SSH_PORT="${{ vars.SSH_PORT || secrets.SSH_PORT }}"
+          SSH_PORT="${SSH_PORT:-22}"
+          SSH_USER="${{ vars.SSH_USER || secrets.SSH_USER }}"
+          SSH_HOST="${{ vars.SSH_HOST || secrets.SSH_HOST }}"
+
+          SSH_CMD="ssh -o ConnectTimeout=30 -p ${SSH_PORT} ${SSH_USER}@${SSH_HOST}"
+
+          echo "::notice::Clearing cache on $HOST_TYPE host..."
+
           case $HOST_TYPE in
-            kinsta) $SSH_CMD "wp kinsta cache purge" || true ;;
-            wpengine) $SSH_CMD "wp engine cache flush" || true ;;
-            pressable) $SSH_CMD "wp pressable cache purge" || true ;;
-            *) $SSH_CMD "wp cache flush" || true ;;
+            kinsta)
+              $SSH_CMD "wp kinsta cache purge --all" 2>/dev/null || \
+              $SSH_CMD "wp kinsta cache purge" 2>/dev/null || \
+              echo "::warning::Kinsta cache clear command not available"
+              ;;
+            wpengine)
+              $SSH_CMD "wp engine cache flush" 2>/dev/null || \
+              echo "::warning::WP Engine cache clear command not available"
+              ;;
+            pressable)
+              $SSH_CMD "wp pressable cache purge" 2>/dev/null || \
+              echo "::warning::Pressable cache clear command not available"
+              ;;
+            *)
+              $SSH_CMD "wp cache flush" 2>/dev/null || \
+              echo "::warning::WP-CLI cache flush not available"
+              ;;
           esac
 
   notify:
+    name: 'Notify'
     needs: [deploy]
     runs-on: ubuntu-latest
     if: always()
-    environment: ${{ inputs.environment }}
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
     steps:
       - name: Slack Notification
+        if: ${{ env.SLACK_WEBHOOK != '' }}
         uses: rtCamp/action-slack-notify@v2
         env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK: ${{ env.SLACK_WEBHOOK }}
           SLACK_CHANNEL: ${{ needs.deploy.outputs.slack_channel || 'deployments' }}
           SLACK_COLOR: ${{ needs.deploy.result == 'success' && 'good' || 'danger' }}
-          SLACK_MESSAGE: "Deployment of ${{ github.repository }} to ${{ github.ref_name }} was a ${{ needs.deploy.result }}."
-          SLACK_TITLE: "Deployment Status"
+          SLACK_MESSAGE: |
+            *Repository:* ${{ github.repository }}
+            *Branch:* ${{ github.ref_name }}
+            *Environment:* ${{ inputs.environment }}
+            *Status:* ${{ needs.deploy.result == 'success' && '✅ Success' || '❌ Failed' }}
+            *Triggered by:* ${{ github.actor }}
+          SLACK_TITLE: WordPress Deployment
           SLACK_USERNAME: ${{ needs.deploy.outputs.slack_username || 'DeployBot' }}
           SLACK_ICON_EMOJI: ${{ needs.deploy.outputs.slack_icon || ':rocket:' }}
-        if: ${{ secrets.SLACK_WEBHOOK != '' }}
+          SLACK_FOOTER: ''
