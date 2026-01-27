@@ -12,6 +12,16 @@ on:
         required: false
         type: string
         default: '8.2'
+      phpcs-standard:
+        description: 'PHPCS coding standard (ignored if phpcs.xml exists)'
+        required: false
+        type: string
+        default: 'WordPress-Core'
+      skip-lint:
+        description: 'Skip linting step'
+        required: false
+        type: boolean
+        default: false
       config-file:
         description: 'Path to wp-deploy-config.yml'
         required: false
@@ -35,6 +45,7 @@ jobs:
   lint:
     name: 'Lint'
     runs-on: ubuntu-latest
+    if: ${{ inputs.skip-lint != true }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,15 +68,33 @@ jobs:
 
       - name: Run PHPCS
         run: |
+          STANDARD="${{ inputs.phpcs-standard }}"
+          
+          # Validate standard input
+          case "$STANDARD" in
+            WordPress|WordPress-Core|WordPress-Extra|WordPress-Docs)
+              ;;
+            *)
+              echo "::warning::Invalid PHPCS standard '$STANDARD', defaulting to WordPress-Core"
+              STANDARD="WordPress-Core"
+              ;;
+          esac
+          
           if [ -f "phpcs.xml" ]; then
+            echo "::notice::Using project phpcs.xml configuration"
+            ./vendor/bin/phpcs .
+          elif [ -f "phpcs.xml.dist" ]; then
+            echo "::notice::Using project phpcs.xml.dist configuration"
             ./vendor/bin/phpcs .
           else
-            ./vendor/bin/phpcs --standard=WordPress-Core --extensions=php --ignore=vendor .
+            echo "::notice::Using $STANDARD standard"
+            ./vendor/bin/phpcs --standard="$STANDARD" --extensions=php --ignore=vendor .
           fi
 
   deploy:
     name: 'Deploy'
     needs: [lint]
+    if: ${{ always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     outputs:
@@ -264,7 +293,7 @@ jobs:
 
   notify:
     name: 'Notify'
-    needs: [deploy]
+    needs: [lint, deploy]
     runs-on: ubuntu-latest
     if: always()
     env:
@@ -281,7 +310,8 @@ jobs:
             *Repository:* ${{ github.repository }}
             *Branch:* ${{ github.ref_name }}
             *Environment:* ${{ inputs.environment }}
-            *Status:* ${{ needs.deploy.result == 'success' && '✅ Success' || '❌ Failed' }}
+            *Lint:* ${{ needs.lint.result == 'skipped' && '⏭️ Skipped' || (needs.lint.result == 'success' && '✅ Passed' || '❌ Failed') }}
+            *Deploy:* ${{ needs.deploy.result == 'success' && '✅ Success' || '❌ Failed' }}
             *Triggered by:* ${{ github.actor }}
           SLACK_TITLE: WordPress Deployment
           SLACK_USERNAME: ${{ needs.deploy.outputs.slack_username || 'DeployBot' }}

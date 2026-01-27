@@ -6,10 +6,10 @@ A centralized, reusable GitHub Actions workflow for deploying WordPress themes, 
 
 - **Multi-host support**: Kinsta, WP Engine, Pressable, and generic WordPress hosts
 - **Project type detection**: Automatically deploys to correct directory (themes/plugins/mu-plugins)
-- **PHP linting**: PHPCS with WordPress Coding Standards
+- **PHP linting**: PHPCS with configurable WordPress Coding Standards
 - **Environment-based deployments**: Development, staging, and production
 - **Automatic cache clearing**: Host-specific cache purging after deploy
-- **Slack notifications**: Configurable deployment alerts
+- **Slack notifications**: Configurable deployment alerts with lint & deploy status
 - **Flexible configuration**: Per-project settings via `wp-deploy-config.yml`
 
 ## Quick Start
@@ -157,10 +157,10 @@ These are always excluded (in addition to your custom excludes):
 - `node_modules/`
 - `vendor/`
 - `wp-deploy-config.yml`
-- `phpcs.xml`
+- `phpcs.xml`, `phpcs.xml.dist`
+- `composer.json`, `composer.lock`
 - `.editorconfig`
-- `.zencoder`
-- `.cursor`
+- `.zencoder`, `.cursor`, `.vscode`, `.idea`
 
 ## Workflow Inputs
 
@@ -168,6 +168,8 @@ These are always excluded (in addition to your custom excludes):
 |-------|-------------|----------|---------|
 | `environment` | Target environment | Yes | — |
 | `php-version` | PHP version for linting | No | `8.2` |
+| `phpcs-standard` | PHPCS coding standard (see below) | No | `WordPress-Core` |
+| `skip-lint` | Skip linting step entirely | No | `false` |
 | `config-file` | Path to config file | No | `wp-deploy-config.yml` |
 
 ### Example with Custom Inputs
@@ -179,7 +181,122 @@ jobs:
     with:
       environment: production
       php-version: '8.1'
+      phpcs-standard: 'WordPress'
       config-file: 'config/deploy.yml'
+    secrets: inherit
+```
+
+### Skip Linting
+
+```yaml
+jobs:
+  deploy:
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/wordpress-deploy.yml@v1
+    with:
+      environment: staging
+      skip-lint: true
+    secrets: inherit
+```
+
+## Linting Standards
+
+The workflow supports four WordPress coding standards via the `phpcs-standard` input:
+
+| Standard | Description | Strictness |
+|----------|-------------|------------|
+| `WordPress-Core` | Code style & formatting (default) | Base level |
+| `WordPress-Docs` | Documentation requirements only | Docs only |
+| `WordPress-Extra` | Best practices & performance warnings | Stricter |
+| `WordPress` | All of the above combined | Most strict |
+
+### WordPress-Core (Recommended Default)
+
+Enforces essential coding standards:
+- Indentation (tabs, not spaces)
+- Spacing around operators, parentheses, brackets
+- Yoda conditions (`if ( true === $var )`)
+- Naming conventions (snake_case)
+- Proper escaping (`esc_html()`, `esc_attr()`, etc.)
+- Input sanitization
+- Nonce verification
+
+### WordPress-Extra
+
+Adds advisory warnings beyond Core:
+- Slow query warnings (`meta_query`, `tax_query`)
+- Discouraged functions (`eval()`, `extract()`)
+- Direct database queries without caching
+- Assignment in conditions
+- Direct filesystem calls (prefer `WP_Filesystem`)
+- Loose comparisons (`==` vs `===`)
+
+### WordPress-Docs
+
+Documentation requirements:
+- File-level docblocks
+- Function/method docblocks with `@param`, `@return`
+- Class docblocks
+
+### Using a Project phpcs.xml
+
+If your project contains a `phpcs.xml` or `phpcs.xml.dist` file, it will be used **instead of** the `phpcs-standard` input. This allows full customization:
+
+```xml
+<?xml version="1.0"?>
+<ruleset name="My Project">
+    <file>.</file>
+    <exclude-pattern>vendor/*</exclude-pattern>
+    <exclude-pattern>node_modules/*</exclude-pattern>
+    
+    <rule ref="WordPress-Core"/>
+    
+    <!-- Or use full WordPress standard with exclusions -->
+    <!-- 
+    <rule ref="WordPress">
+        <exclude name="WordPress.DB.SlowDBQuery"/>
+        <exclude name="WordPress.WP.AlternativeFunctions"/>
+    </rule>
+    -->
+</ruleset>
+```
+
+### Exposing Linting Standard as a Dropdown
+
+To let users choose the linting standard when manually triggering deployments:
+
+```yaml
+name: 'Deploy'
+
+on:
+  push:
+    branches: [main, staging, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      phpcs-standard:
+        description: 'Linting standard'
+        required: false
+        type: choice
+        options:
+          - WordPress-Core
+          - WordPress
+          - WordPress-Extra
+          - WordPress-Docs
+        default: 'WordPress-Core'
+
+jobs:
+  deploy:
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/wordpress-deploy.yml@v1
+    with:
+      environment: ${{ github.event.inputs.environment || (github.ref_name == 'main' && 'production') || (github.ref_name == 'staging' && 'staging') || 'development' }}
+      phpcs-standard: ${{ github.event.inputs.phpcs-standard || 'WordPress-Core' }}
     secrets: inherit
 ```
 
@@ -232,6 +349,17 @@ By default, the caller workflow maps branches to environments:
 
 Manual deployments via `workflow_dispatch` allow selecting any environment.
 
+## Slack Notifications
+
+When `SLACK_WEBHOOK` is configured, notifications include:
+
+- Repository name
+- Branch name
+- Environment
+- Lint status (Passed / Failed / Skipped)
+- Deploy status (Success / Failed)
+- Triggered by (username)
+
 ## Troubleshooting
 
 ### SSH Connection Failed
@@ -243,7 +371,8 @@ Manual deployments via `workflow_dispatch` allow selecting any environment.
 ### PHPCS Errors
 
 - Add a `phpcs.xml` to your project to customize rules
-- Or fix the coding standards violations 😉
+- Use `phpcs-standard: 'WordPress-Core'` for less strict linting
+- Use `skip-lint: true` to bypass linting temporarily (not recommended for production)
 
 ### Files Not Deploying
 
