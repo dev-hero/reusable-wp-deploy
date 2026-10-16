@@ -337,6 +337,10 @@ This workflow follows semantic versioning:
 | `@v1.2.0` | Exact version | When you need guaranteed stability |
 | `@main` | Latest development | Testing new features |
 
+### Releasing
+
+Push a full semver tag (e.g. `git tag v1.0.5 && git push origin v1.0.5`). The `update-major-tag.yml` workflow then moves the matching major tag (`v1`) to that release automatically.
+
 ## Branch → Environment Mapping
 
 By default, the caller workflow maps branches to environments:
