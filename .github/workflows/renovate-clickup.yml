@@ -1,0 +1,175 @@
+name: Renovate → ClickUp
+
+# Reusable workflow: mirrors Mend Renovate pull requests into ClickUp.
+#
+# No IDs live in any repo. Routing comes from the org-level custom property
+# "clickup_space" (Org settings → Repository → Custom properties), set per repo
+# to a ClickUp space name or ID. The workflow finds (or creates) a list named
+# "Dependency Updates" in that space. Optional property "clickup_list_id"
+# overrides the list for odd cases. Repos with neither property are skipped.
+#
+#   opened / reopened  -> create the task (or reopen it)
+#   edited (title)     -> rename the task
+#   closed             -> comment merged/closed and close the task
+
+on:
+  workflow_call:
+    inputs:
+      list-name:
+        description: List to find or create in the client's space
+        required: false
+        type: string
+        default: Dependency Updates
+      bot-login:
+        description: GitHub login of the PR author to track
+        required: false
+        type: string
+        default: renovate[bot]
+      tags:
+        description: Comma-separated ClickUp tags for new tasks
+        required: false
+        type: string
+        default: renovate
+      priority:
+        description: "ClickUp priority for new tasks: 1=urgent 2=high 3=normal 4=low, empty for none"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CLICKUP_API_TOKEN:
+        description: ClickUp personal API token (pk_...)
+        required: true
+
+jobs:
+  sync:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == inputs.bot-login &&
+      (github.event.action != 'edited' || github.event.changes.title.from != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: renovate-clickup-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Sync PR to ClickUp
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          LIST_NAME: ${{ inputs.list-name }}
+          TAGS: ${{ inputs.tags }}
+          PRIORITY: ${{ inputs.priority }}
+          ACTION: ${{ github.event.action }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ', ') }}
+          MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          API="${CLICKUP_API_BASE:-https://api.clickup.com/api/v2}"
+          GH_API="${GITHUB_API_URL:-https://api.github.com}"
+          MARKER="[${REPO}#${PR_NUMBER}]"
+          NAME="${MARKER} ${PR_TITLE}"
+
+          cu() { # cu METHOD PATH [JSON]
+            local args=(-fsS --retry 3 -X "$1" -H "Authorization: ${CLICKUP_TOKEN}" -H "Content-Type: application/json")
+            [ $# -ge 3 ] && args+=(--data "$3")
+            curl "${args[@]}" "${API}$2"
+          }
+
+          # --- 1. Where does this repo's work go? (repo custom properties) ---
+          props=$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${GH_API}/repos/${REPO}/properties/values")
+          prop() { jq -r --arg n "$1" '[.[] | select(.property_name == $n) | .value][0] // empty' <<<"$props"; }
+          SPACE=$(prop clickup_space)
+          LIST_ID=$(prop clickup_list_id)
+
+          if [ -z "$LIST_ID" ]; then
+            if [ -z "$SPACE" ]; then
+              echo "::notice::${REPO} has no clickup_space custom property; skipping."
+              exit 0
+            fi
+            # Resolve space by ID or (case-insensitive) name across workspaces.
+            SPACE_ID=""
+            for team in $(cu GET "/team" | jq -r '.teams[].id'); do
+              SPACE_ID=$(cu GET "/team/${team}/space?archived=false" | jq -r --arg s "$SPACE" \
+                '[.spaces[] | select(.id == $s or (.name | ascii_downcase) == ($s | ascii_downcase)) | .id][0] // empty')
+              [ -n "$SPACE_ID" ] && break
+            done
+            if [ -z "$SPACE_ID" ]; then
+              echo "::error::No ClickUp space matches clickup_space='${SPACE}' for ${REPO}."
+              exit 1
+            fi
+            LIST_ID=$(cu GET "/space/${SPACE_ID}/list?archived=false" | jq -r --arg l "$LIST_NAME" \
+              '[.lists[] | select((.name | ascii_downcase) == ($l | ascii_downcase)) | .id][0] // empty')
+            if [ -z "$LIST_ID" ]; then
+              LIST_ID=$(cu POST "/space/${SPACE_ID}/list" "$(jq -n --arg n "$LIST_NAME" \
+                '{name: $n, content: "Tasks created automatically from Renovate pull requests."}')" | jq -r '.id')
+              echo "Created list '${LIST_NAME}' (${LIST_ID}) in space ${SPACE_ID}"
+            fi
+          fi
+          echo "Using ClickUp list ${LIST_ID}"
+
+          # --- 2. Sync the task ---
+          find_task() {
+            local page=0 resp id
+            while :; do
+              resp=$(cu GET "/list/${LIST_ID}/task?include_closed=true&subtasks=true&archived=false&page=${page}")
+              id=$(jq -r --arg m "$MARKER" '[.tasks[] | select(.name | startswith($m)) | .id][0] // empty' <<<"$resp")
+              if [ -n "$id" ]; then echo "$id"; return; fi
+              if [ "$(jq -r '.last_page // false' <<<"$resp")" = "true" ] || [ "$(jq '.tasks | length' <<<"$resp")" = "0" ]; then return; fi
+              page=$((page + 1))
+            done
+          }
+
+          statuses=$(cu GET "/list/${LIST_ID}" | jq '.statuses')
+          OPEN_STATUS=$(jq -r '[.[] | select(.type == "open")][0].status // empty' <<<"$statuses")
+          CLOSED_STATUS=$(jq -r '([.[] | select(.type == "closed")] + [.[] | select(.type == "done")])[0].status // empty' <<<"$statuses")
+
+          TASK_ID=$(find_task)
+
+          case "$ACTION" in
+            opened|reopened|edited)
+              if [ -z "$TASK_ID" ]; then
+                # shellcheck disable=SC2016 # backticks are literal markdown
+                desc=$(printf '**Renovate PR:** [%s#%s](%s)\n\n- **Title:** %s\n- **Branch:** `%s` → `%s`\n- **Labels:** %s\n\n_Created automatically by the Renovate → ClickUp workflow. Closes automatically when the PR is merged or closed._' \
+                  "$REPO" "$PR_NUMBER" "$PR_URL" "$PR_TITLE" "$PR_BRANCH" "$PR_BASE" "${PR_LABELS:-none}")
+                body=$(jq -n --arg name "$NAME" --arg desc "$desc" --arg tags "$TAGS" --arg prio "$PRIORITY" '
+                  {name: $name, markdown_description: $desc,
+                   tags: ($tags | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))}
+                  + (if $prio == "" then {} else {priority: ($prio | tonumber)} end)')
+                TASK_ID=$(cu POST "/list/${LIST_ID}/task" "$body" | jq -r '.id')
+                echo "Created ClickUp task ${TASK_ID}"
+              else
+                upd=$(jq -n --arg name "$NAME" --arg st "$OPEN_STATUS" --arg action "$ACTION" '
+                  {name: $name} + (if $action == "reopened" and $st != "" then {status: $st} else {} end)')
+                cu PUT "/task/${TASK_ID}" "$upd" >/dev/null
+                echo "Updated ClickUp task ${TASK_ID}"
+              fi
+              ;;
+            closed)
+              if [ -z "$TASK_ID" ]; then
+                echo "No ClickUp task for ${MARKER}; nothing to close."
+                exit 0
+              fi
+              if [ "$PR_MERGED" = "true" ]; then
+                note="PR merged by @${MERGED_BY}: ${PR_URL}"
+              else
+                note="PR closed without merging (superseded or abandoned): ${PR_URL}"
+              fi
+              cu POST "/task/${TASK_ID}/comment" "$(jq -n --arg t "$note" '{comment_text: $t, notify_all: false}')" >/dev/null
+              if [ -n "$CLOSED_STATUS" ]; then
+                cu PUT "/task/${TASK_ID}" "$(jq -n --arg st "$CLOSED_STATUS" '{status: $st}')" >/dev/null
+              fi
+              echo "Closed ClickUp task ${TASK_ID}"
+              ;;
+            *)
+              echo "Ignoring action: ${ACTION}"
+              ;;
+          esac
