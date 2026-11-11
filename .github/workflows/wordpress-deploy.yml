@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ inputs.skip-lint != true }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
@@ -102,7 +102,7 @@ jobs:
       slack_username: ${{ steps.config.outputs.slack_username }}
       slack_icon: ${{ steps.config.outputs.slack_icon }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Tools
         run: |
