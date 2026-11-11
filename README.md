@@ -436,7 +436,7 @@ In the organization: **Settings → Repository → Custom properties**.
 
 Set `clickup_space` on each repository. The name match is case-insensitive. The token's workspaces are searched until a space matches.
 
-The workflow then looks for a list named `Dependency Updates` in that space and creates it when it is missing. Override the list name with the `list-name` input.
+The workflow then looks for a list named `Dependency Updates` in that space and creates it when it is missing. A list created by the workflow keeps ClickUp's default icon and sets that icon's color to orange. Override the list name with the `list-name` input.
 
 If `clickup_space` is set but no space matches, the job fails. If neither property is set, the job exits successfully and logs a notice.
 

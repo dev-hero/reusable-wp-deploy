@@ -5,7 +5,8 @@ name: Renovate → ClickUp
 # No IDs live in any repo. Routing comes from the org-level custom property
 # "clickup_space" (Org settings → Repository → Custom properties), set per repo
 # to a ClickUp space name or ID. The workflow finds (or creates) a list named
-# "Dependency Updates" in that space. Optional property "clickup_list_id"
+# "Dependency Updates" in that space. A list created here uses ClickUp's default
+# icon, colored orange. Optional property "clickup_list_id"
 # overrides the list for odd cases. Repos with neither property are skipped.
 #
 #   opened / reopened  -> create the task (or reopen it)
@@ -110,7 +111,7 @@ jobs:
               '[.lists[] | select((.name | ascii_downcase) == ($l | ascii_downcase)) | .id][0] // empty')
             if [ -z "$LIST_ID" ]; then
               LIST_ID=$(cu POST "/space/${SPACE_ID}/list" "$(jq -n --arg n "$LIST_NAME" \
-                '{name: $n, content: "Tasks created automatically from Renovate pull requests."}')" | jq -r '.id')
+                '{name: $n, content: "Tasks created automatically from Renovate pull requests.", status: "orange"}')" | jq -r '.id')
               echo "Created list '${LIST_NAME}' (${LIST_ID}) in space ${SPACE_ID}"
             fi
           fi
