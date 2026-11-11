@@ -2,7 +2,19 @@
 
 A centralized, reusable GitHub Actions workflow for deploying WordPress themes, plugins, and mu-plugins to managed hosting environments.
 
-This repository also includes [Renovate → ClickUp](#renovate--clickup), a reusable workflow that mirrors Renovate pull requests into ClickUp tasks.
+This repository also includes two more reusable workflows:
+
+- [PR Build Check](#pr-build-check) builds front-end assets on every pull request.
+- [Renovate → ClickUp](#renovate--clickup) mirrors Renovate pull requests into ClickUp tasks.
+
+| Workflow | Called from other projects | Purpose |
+|----------|---------------------------|---------|
+| `wordpress-deploy.yml` | Yes | Lint and deploy a theme or plugin |
+| `pr-build.yml` | Yes | Build front-end assets on pull requests |
+| `renovate-clickup.yml` | Yes | Sync Renovate pull requests to ClickUp |
+| `release.yml` | No | Runs in this repository to cut releases. See [Releasing](#releasing) |
+
+Each shared workflow has the same filename as the caller file a project adds, so a project's `.github/workflows/pr-build.yml` calls this repository's `pr-build.yml`.
 
 ## Features
 
@@ -331,17 +343,47 @@ jobs:
 
 ## Versioning
 
-This workflow follows semantic versioning:
+Every workflow in this repository is released together under one set of semantic version tags:
 
 | Reference | Description | Use Case |
 |-----------|-------------|----------|
 | `@v1` | Latest v1.x.x | Recommended for most projects |
-| `@v1.2.0` | Exact version | When you need guaranteed stability |
+| `@vX.Y.Z` | Exact version | When you need guaranteed stability |
 | `@main` | Latest development | Testing new features |
 
 ### Releasing
 
-Push a full semver tag (e.g. `git tag v1.0.5 && git push origin v1.0.5`). The `update-major-tag.yml` workflow then moves the matching major tag (`v1`) to that release automatically. Those tags cover every reusable workflow in this repository.
+Releases are automated with [release-please](https://github.com/googleapis/release-please-action) through `release.yml`:
+
+1. Merge changes to `main` with a [Conventional Commits](https://www.conventionalcommits.org/) message. With squash merging, only the pull request title needs the prefix.
+2. release-please opens or updates a release pull request. It bumps `version.txt` and adds the new entry to `CHANGELOG.md`.
+3. Merging the release pull request creates the `vX.Y.Z` tag and a GitHub Release with the same notes.
+4. `release.yml` then moves the major tag (`v1`) to the new release. Projects on `@v1` pick it up on their next run. Projects pinned to an exact tag stay on it until their caller changes.
+
+The prefix decides the version bump and the changelog section:
+
+| Prefix | Bump | Changelog section |
+|--------|------|-------------------|
+| `feat:` | Minor | Added |
+| `fix:` | Patch | Fixed |
+| `perf:`, `refactor:`, `revert:` | Patch | Changed |
+| `docs:` | Patch | Documentation |
+| `chore:`, `ci:`, `build:`, `test:`, `style:` | None | Hidden |
+| `feat!:` or a `BREAKING CHANGE:` footer | Major, and callers on `@v1` must move to the new major tag | Breaking changes |
+
+Commits without a prefix are left out of the changelog and do not trigger a release.
+
+Renovate updates to the actions these workflows use are titled `fix(deps): ...`, so each one ships as a patch release.
+
+Nothing references `release.yml`. It has no `workflow_call` trigger and only runs in this repository. Pushing a version tag by hand still works: the tag trigger moves `v1` to it.
+
+### Renamed workflows
+
+`v1.0.5` shipped the ClickUp workflow as `reusable-renovate-clickup.yml`. From `v1.0.6` it is `renovate-clickup.yml`. A caller on `@v1` still pointing at the old name fails once `v1` moves to `v1.0.6` or later, so update the `uses:` line in each project:
+
+```yaml
+uses: dev-hero/reusable-wp-deploy/.github/workflows/renovate-clickup.yml@v1
+```
 
 ## Branch → Environment Mapping
 
@@ -390,9 +432,52 @@ When `SLACK_WEBHOOK` is configured, notifications include:
 - Verify `HOST_TYPE` variable or `project.host` in config matches your host
 - Some hosts require WP-CLI to be available on the server
 
+## PR Build Check
+
+Reusable workflow: [`.github/workflows/pr-build.yml`](.github/workflows/pr-build.yml).
+
+Runs `npm ci` and the project's build on each pull request, then confirms the expected build output exists. A broken build fails the pull request instead of surfacing at deploy time.
+
+A repository without `package.json` passes with a notice, so PHP-only themes and plugins can use the same caller file. A repository with `package.json` but no `package-lock.json` fails, because `npm ci` requires the lockfile.
+
+### Add the caller workflow
+
+Create `.github/workflows/pr-build.yml`:
+
+```yaml
+name: 'PR Build Check'
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/pr-build.yml@v1
+```
+
+A project whose build writes somewhere other than `dist/` sets `output-paths`. For example, to require both the JavaScript and CSS folders:
+
+```yaml
+jobs:
+  build:
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/pr-build.yml@v1
+    with:
+      output-paths: dist/js dist/css
+```
+
+### PR Build Check inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `node-version-file` | File that pins the Node version | No | `.nvmrc` |
+| `node-version` | Node version used when `node-version-file` does not exist | No | `24` |
+| `build-command` | Command that builds the assets | No | `npm run build` |
+| `output-paths` | Space-separated paths that must exist after the build. Empty skips the check | No | `dist` |
+
 ## Renovate → ClickUp
 
-Reusable workflow: [`.github/workflows/reusable-renovate-clickup.yml`](.github/workflows/reusable-renovate-clickup.yml).
+Reusable workflow: [`.github/workflows/renovate-clickup.yml`](.github/workflows/renovate-clickup.yml).
 
 Mirrors Mend Renovate pull requests into ClickUp. ClickUp IDs stay out of every repository. Each repo is routed with an organization custom property, and the workflow finds or creates a **Dependency Updates** list in that space.
 
@@ -418,7 +503,7 @@ on:
 
 jobs:
   sync:
-    uses: dev-hero/reusable-wp-deploy/.github/workflows/reusable-renovate-clickup.yml@v1
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/renovate-clickup.yml@v1
     secrets:
       CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
 ```
@@ -466,7 +551,7 @@ On close, a merged pull request is commented as merged by the merging user. A pu
 ```yaml
 jobs:
   sync:
-    uses: dev-hero/reusable-wp-deploy/.github/workflows/reusable-renovate-clickup.yml@v1
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/renovate-clickup.yml@v1
     with:
       list-name: Renovate
       tags: renovate, dependencies

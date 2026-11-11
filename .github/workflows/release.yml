@@ -1,0 +1,55 @@
+name: Release
+
+# Not callable from other projects. On pushes to main, release-please keeps a
+# release pull request open; merging it tags the release and publishes notes.
+# The major tag (e.g. v1) then moves to that release.
+#
+# Tags created with GITHUB_TOKEN do not trigger workflows, so the major tag is
+# moved here instead of in a separate tag-triggered workflow. Pushing a version
+# tag by hand still moves it through the tag trigger below.
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+
+  major-tag:
+    needs: release-please
+    if: >-
+      always() &&
+      (github.ref_type == 'tag' || needs.release-please.outputs.release_created == 'true')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Move major tag to this release
+        run: |
+          MAJOR="${TAG%%.*}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git tag -fa "$MAJOR" HEAD -m "$MAJOR -> $TAG"
+          git push -f origin "refs/tags/$MAJOR"

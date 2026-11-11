@@ -1,0 +1,92 @@
+name: 'PR Build Check'
+
+# Reusable workflow: installs npm dependencies and builds front-end assets so a
+# pull request fails before merge when the build is broken.
+#
+# Repos without package.json pass with a notice, so PHP-only themes and plugins
+# can call this too.
+
+on:
+  workflow_call:
+    inputs:
+      node-version-file:
+        description: 'File that pins the Node version (falls back to node-version if missing)'
+        required: false
+        type: string
+        default: '.nvmrc'
+      node-version:
+        description: 'Node version to use when node-version-file does not exist'
+        required: false
+        type: string
+        default: '24'
+      build-command:
+        description: 'Command that builds the assets'
+        required: false
+        type: string
+        default: 'npm run build'
+      output-paths:
+        description: 'Space-separated paths that must exist after the build. Empty skips the check'
+        required: false
+        type: string
+        default: 'dist'
+
+jobs:
+  build:
+    name: 'Build'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Node project
+        id: detect
+        env:
+          NODE_VERSION_FILE: ${{ inputs.node-version-file }}
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::notice::No package.json found; skipping the asset build."
+            echo "node=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -f package-lock.json ]; then
+            echo "::error::package.json exists but package-lock.json does not. Commit the lockfile so npm ci can install."
+            exit 1
+          fi
+          echo "node=true" >> "$GITHUB_OUTPUT"
+          if [ -f "$NODE_VERSION_FILE" ]; then
+            echo "version-file=$NODE_VERSION_FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${NODE_VERSION_FILE} not found; using Node ${{ inputs.node-version }}."
+          fi
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ steps.detect.outputs.version-file }}
+          node-version: ${{ steps.detect.outputs.version-file == '' && inputs.node-version || '' }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.detect.outputs.node == 'true'
+        run: npm ci
+
+      - name: Build assets
+        if: steps.detect.outputs.node == 'true'
+        run: ${{ inputs.build-command }}
+
+      - name: Check build output
+        if: steps.detect.outputs.node == 'true' && inputs.output-paths != ''
+        env:
+          OUTPUT_PATHS: ${{ inputs.output-paths }}
+        run: |
+          missing=0
+          for path in $OUTPUT_PATHS; do
+            if [ -e "$path" ]; then
+              ls -la "$path"
+            else
+              echo "::error::Expected build output '${path}' was not created."
+              missing=1
+            fi
+          done
+          exit "$missing"
