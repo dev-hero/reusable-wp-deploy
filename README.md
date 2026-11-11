@@ -1,9 +1,8 @@
-# Reusable WordPress Deploy Workflow
+# Reusable WordPress Workflows
 
-A centralized, reusable GitHub Actions workflow for deploying WordPress themes, plugins, and mu-plugins to managed hosting environments.
+Shared GitHub Actions workflows for Dev Hero's WordPress themes and plugins:
 
-This repository also includes two more reusable workflows:
-
+- [WordPress Deploy](#deploy-features) lints and deploys themes, plugins, and mu-plugins to managed hosting.
 - [PR Build Check](#pr-build-check) builds front-end assets on every pull request.
 - [Renovate → ClickUp](#renovate--clickup) mirrors Renovate pull requests into ClickUp tasks.
 
@@ -16,7 +15,9 @@ This repository also includes two more reusable workflows:
 
 Each shared workflow has the same filename as the caller file a project adds, so a project's `.github/workflows/pr-build.yml` calls this repository's `pr-build.yml`.
 
-## Features
+## Deploy Features
+
+Reusable workflow: [`.github/workflows/wordpress-deploy.yml`](.github/workflows/wordpress-deploy.yml).
 
 - **Multi-host support**: Kinsta, WP Engine, Pressable, and generic WordPress hosts
 - **Project type detection**: Automatically deploys to correct directory (themes/plugins/mu-plugins)
@@ -26,7 +27,7 @@ Each shared workflow has the same filename as the caller file a project adds, so
 - **Slack notifications**: Configurable deployment alerts with lint & deploy status
 - **Flexible configuration**: Per-project settings via `wp-deploy-config.yml`
 
-## Quick Start
+## Deploy Quick Start
 
 ### 1. Add the Caller Workflow
 
@@ -98,13 +99,13 @@ These can be set as either variables or secrets (variables take precedence):
 |------|-------------|---------|
 | `SSH_HOST` | Server hostname | `ssh.kinsta.cloud` |
 | `SSH_USER` | SSH username | `deploy-user` |
-| `SSH_PORT` | SSH port (default: 22) | `22` |
-| `WP_CONTENT_PATH` | Path to wp-content directory | `/www/mysite/public/wp-content` |
+| `WP_CONTENT_PATH` | Path to the `wp-content` directory. A path without `wp-content` has `/wp-content` appended | `/www/mysite/public/wp-content` |
 
 #### Optional Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `SSH_PORT` | SSH port. Can also be a secret | `22` |
 | `HOST_TYPE` | Override host type from config | Value from `wp-deploy-config.yml` |
 
 #### Optional Secrets
@@ -126,6 +127,8 @@ Each environment can have its own secrets/variables and protection rules (e.g., 
 ## Configuration Reference
 
 ### `wp-deploy-config.yml`
+
+A complete example lives in [`examples/wp-deploy-config.yml`](examples/wp-deploy-config.yml). Branch-to-environment mapping is not set here; it comes from the caller workflow (see [Branch → Environment Mapping](#branch--environment-mapping)).
 
 ```yaml
 project:
@@ -176,7 +179,18 @@ These are always excluded (in addition to your custom excludes):
 - `.editorconfig`
 - `.zencoder`, `.cursor`, `.vscode`, `.idea`
 
-## Workflow Inputs
+`vendor/` is always excluded, so a plugin that needs Composer packages at runtime will not have them on the server.
+
+### Files Removed on the Server
+
+rsync runs with `--delete --delete-excluded`. After a deploy, the project's directory on the server matches the repository exactly:
+
+- Files on the server that are not in the repository are deleted.
+- Files that match an exclude pattern are deleted from the server too, even if they were uploaded some other way.
+
+Anything a site writes into the theme or plugin directory at runtime, such as generated caches or uploaded files, is removed on the next deploy. Store that data under `wp-content/uploads` instead.
+
+## Deploy Workflow Inputs
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
@@ -213,6 +227,11 @@ jobs:
 ```
 
 ## Linting Standards
+
+The lint job installs PHPCS one of two ways:
+
+- **No `composer.json` in the project:** it installs PHP_CodeSniffer 3 and WordPress Coding Standards 3 on the fly.
+- **A `composer.json` in the project:** it runs `composer install` and uses the project's `vendor/bin/phpcs`. The project's `require-dev` must include `squizlabs/php_codesniffer` and `wp-coding-standards/wpcs`, or the lint job fails.
 
 The workflow supports four WordPress coding standards via the `phpcs-standard` input:
 
@@ -341,50 +360,6 @@ jobs:
 2. Add public key via Pressable SFTP settings
 3. Set secrets accordingly based on Pressable's SSH access details
 
-## Versioning
-
-Every workflow in this repository is released together under one set of semantic version tags:
-
-| Reference | Description | Use Case |
-|-----------|-------------|----------|
-| `@v1` | Latest v1.x.x | Recommended for most projects |
-| `@vX.Y.Z` | Exact version | When you need guaranteed stability |
-| `@main` | Latest development | Testing new features |
-
-### Releasing
-
-Releases are automated with [release-please](https://github.com/googleapis/release-please-action) through `release.yml`:
-
-1. Merge changes to `main` with a [Conventional Commits](https://www.conventionalcommits.org/) message. With squash merging, only the pull request title needs the prefix.
-2. release-please opens or updates a release pull request. It bumps `version.txt` and adds the new entry to `CHANGELOG.md`.
-3. Merging the release pull request creates the `vX.Y.Z` tag and a GitHub Release with the same notes.
-4. `release.yml` then moves the major tag (`v1`) to the new release. Projects on `@v1` pick it up on their next run. Projects pinned to an exact tag stay on it until their caller changes.
-
-The prefix decides the version bump and the changelog section:
-
-| Prefix | Bump | Changelog section |
-|--------|------|-------------------|
-| `feat:` | Minor | Added |
-| `fix:` | Patch | Fixed |
-| `perf:`, `refactor:`, `revert:` | Patch | Changed |
-| `docs:` | Patch | Documentation |
-| `chore:`, `ci:`, `build:`, `test:`, `style:` | None | Hidden |
-| `feat!:` or a `BREAKING CHANGE:` footer | Major, and callers on `@v1` must move to the new major tag | Breaking changes |
-
-Commits without a prefix are left out of the changelog and do not trigger a release.
-
-Renovate updates to the actions these workflows use are titled `fix(deps): ...`, so each one ships as a patch release.
-
-Nothing references `release.yml`. It has no `workflow_call` trigger and only runs in this repository. Pushing a version tag by hand still works: the tag trigger moves `v1` to it.
-
-### Renamed workflows
-
-`v1.0.5` shipped the ClickUp workflow as `reusable-renovate-clickup.yml`. From `v1.0.6` it is `renovate-clickup.yml`. A caller on `@v1` still pointing at the old name fails once `v1` moves to `v1.0.6` or later, so update the `uses:` line in each project:
-
-```yaml
-uses: dev-hero/reusable-wp-deploy/.github/workflows/renovate-clickup.yml@v1
-```
-
 ## Branch → Environment Mapping
 
 By default, the caller workflow maps branches to environments:
@@ -408,7 +383,7 @@ When `SLACK_WEBHOOK` is configured, notifications include:
 - Deploy status (Success / Failed)
 - Triggered by (username)
 
-## Troubleshooting
+## Deploy Troubleshooting
 
 ### SSH Connection Failed
 
@@ -418,14 +393,19 @@ When `SLACK_WEBHOOK` is configured, notifications include:
 
 ### PHPCS Errors
 
+- If the log says `vendor/bin/phpcs` is not found, the project has a `composer.json` without PHPCS in `require-dev`. See [Linting Standards](#linting-standards)
 - Add a `phpcs.xml` to your project to customize rules
 - Use `phpcs-standard: 'WordPress-Core'` for less strict linting
 - Use `skip-lint: true` to bypass linting temporarily (not recommended for production)
 
 ### Files Not Deploying
 
-- Check if the file matches an exclude pattern
+- Check if the file matches an exclude pattern, including the [default excludes](#default-excludes)
 - Review the rsync output in the workflow logs
+
+### Files Disappeared From the Server
+
+- The deploy deletes anything in the project's server directory that is not in the repository. See [Files Removed on the Server](#files-removed-on-the-server)
 
 ### Cache Not Clearing
 
@@ -566,11 +546,56 @@ jobs:
 - **Job failed looking up the space.** The token cannot see a space with that name or ID. Check the property value and the token's workspace access.
 - **Task did not reopen or close.** The destination list needs a status of type open, and a status of type closed or done. The close comment is still posted when a status is missing.
 
+## Versioning
+
+Every workflow in this repository is released together under one set of semantic version tags:
+
+| Reference | Description | Use Case |
+|-----------|-------------|----------|
+| `@v1` | Latest v1.x.x | Recommended for most projects |
+| `@vX.Y.Z` | Exact version | When you need guaranteed stability |
+| `@main` | Latest development | Testing new features |
+
+### Releasing
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please-action) through `release.yml`:
+
+1. Merge changes to `main` with a [Conventional Commits](https://www.conventionalcommits.org/) message. When squash merging, the squashed commit takes the commit message for a single-commit pull request and the pull request title otherwise, so give both the prefix.
+2. release-please opens or updates a release pull request. It bumps `version.txt` and `.release-please-manifest.json` and adds the new entry to `CHANGELOG.md`.
+3. Merging the release pull request creates the `vX.Y.Z` tag and a GitHub Release with the same notes.
+4. `release.yml` then moves the major tag (`v1`) to the new release. Projects on `@v1` pick it up on their next run. Projects pinned to an exact tag stay on it until their caller changes.
+
+The prefix decides the version bump and the changelog section:
+
+| Prefix | Bump | Changelog section |
+|--------|------|-------------------|
+| `feat:` | Minor | Added |
+| `fix:` | Patch | Fixed |
+| `perf:`, `refactor:`, `revert:` | Patch | Changed |
+| `docs:` | Patch | Documentation |
+| `chore:`, `ci:`, `build:`, `test:`, `style:` | None | Hidden |
+| `feat!:` or a `BREAKING CHANGE:` footer | Major, and callers on `@v1` must move to the new major tag | Breaking changes |
+
+Commits without a prefix are left out of the changelog and do not trigger a release.
+
+Renovate updates to the actions these workflows use are titled `fix(deps): ...`, so each one ships as a patch release.
+
+Nothing references `release.yml`. It has no `workflow_call` trigger and only runs in this repository. Pushing a version tag by hand still works: the tag trigger moves `v1` to it.
+
+### Renamed workflows
+
+`v1.0.5` shipped the ClickUp workflow as `reusable-renovate-clickup.yml`. From `v1.0.6` it is `renovate-clickup.yml`. A caller on `@v1` still pointing at the old name fails once `v1` moves to `v1.0.6` or later, so update the `uses:` line in each project:
+
+```yaml
+uses: dev-hero/reusable-wp-deploy/.github/workflows/renovate-clickup.yml@v1
+```
+
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
+1. Create a branch from `main`.
+2. Make the change, and update this README in the same pull request when a workflow's inputs, secrets, or behavior change. Releases do not touch the README.
+3. Open a pull request with a Conventional Commits title, such as `feat: add php-lint input to pr-build`. See [Releasing](#releasing) for how the prefix sets the version.
+4. Squash and merge. Do not edit `CHANGELOG.md` or `version.txt` by hand; release-please updates both.
 
 ## License
 

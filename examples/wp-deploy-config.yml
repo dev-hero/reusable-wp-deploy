@@ -1,29 +1,26 @@
 # WordPress Deployment Configuration
 # ===================================
 # This file configures how this project is deployed to WordPress environments.
-# Used by the centralized wp-deploy reusable workflow.
+# Used by the shared wordpress-deploy.yml reusable workflow.
+#
+# Branch-to-environment mapping is not set here. The caller workflow chooses
+# the environment (see the README's Branch → Environment Mapping section).
 
 project:
   # Project type determines the wp-content subdirectory
-  # Options: theme, plugin, mu-plugin, drop-in
+  # Options: theme, plugin, mu-plugin (anything else falls back to theme)
   type: theme
 
   # Directory name on the server (usually matches repo name)
   slug: yoko-digitalai-child
 
   # Hosting provider for automated post-deploy commands
-  # Options: kinsta, wpengine, pressable, generic
+  # Options: kinsta, wpengine, pressable, generic (default: generic)
   host: kinsta
 
-# Branch to environment mapping
-# Maps git branches to GitHub Environments (where secrets are stored)
-environments:
-  main: production
-  staging: staging
-  develop: development
-
 # Additional files/directories to exclude from deployment
-# These are added to the default excludes for the project type
+# These are added to the default excludes listed in the README.
+# Excluded files are also deleted from the server on deploy.
 excludes:
 - "*.md"
 - "*.scss"
@@ -37,6 +34,7 @@ excludes:
 - "phpcs.xml"
 - "config.codekit3"
 - "*.yml"
+
 # Slack Notifications
 slack:
   channel: "#deployments"
