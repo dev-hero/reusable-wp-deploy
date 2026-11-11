@@ -2,6 +2,8 @@
 
 A centralized, reusable GitHub Actions workflow for deploying WordPress themes, plugins, and mu-plugins to managed hosting environments.
 
+This repository also includes [Renovate → ClickUp](#renovate--clickup), a reusable workflow that mirrors Renovate pull requests into ClickUp tasks.
+
 ## Features
 
 - **Multi-host support**: Kinsta, WP Engine, Pressable, and generic WordPress hosts
@@ -339,7 +341,7 @@ This workflow follows semantic versioning:
 
 ### Releasing
 
-Push a full semver tag (e.g. `git tag v1.0.5 && git push origin v1.0.5`). The `update-major-tag.yml` workflow then moves the matching major tag (`v1`) to that release automatically.
+Push a full semver tag (e.g. `git tag v1.0.5 && git push origin v1.0.5`). The `update-major-tag.yml` workflow then moves the matching major tag (`v1`) to that release automatically. Those tags cover every reusable workflow in this repository.
 
 ## Branch → Environment Mapping
 
@@ -387,6 +389,97 @@ When `SLACK_WEBHOOK` is configured, notifications include:
 
 - Verify `HOST_TYPE` variable or `project.host` in config matches your host
 - Some hosts require WP-CLI to be available on the server
+
+## Renovate → ClickUp
+
+Reusable workflow: [`.github/workflows/reusable-renovate-clickup.yml`](.github/workflows/reusable-renovate-clickup.yml).
+
+Mirrors Mend Renovate pull requests into ClickUp. ClickUp IDs stay out of every repository. Each repo is routed with an organization custom property, and the workflow finds or creates a **Dependency Updates** list in that space.
+
+| Pull request event | ClickUp result |
+|--------------------|----------------|
+| `opened` | Create a task |
+| `reopened` | Reopen the existing task, or create it if it is missing |
+| `edited` (title only) | Rename the task |
+| `closed` | Comment whether the PR was merged or closed, then close the task |
+
+Pull requests from any author other than `renovate[bot]` are ignored. Edits that do not change the title are ignored. A repository with neither custom property below is skipped.
+
+### 1. Add the caller workflow
+
+Create `.github/workflows/renovate-clickup.yml` in each repository Renovate opens pull requests against:
+
+```yaml
+name: Renovate → ClickUp
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, closed]
+
+jobs:
+  sync:
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/reusable-renovate-clickup.yml@v1
+    secrets:
+      CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+```
+
+`secrets: inherit` works too, as long as the caller can see `CLICKUP_API_TOKEN`.
+
+### 2. Route the repository
+
+In the organization: **Settings → Repository → Custom properties**.
+
+| Property | Required | Value |
+|----------|----------|-------|
+| `clickup_space` | Yes, unless `clickup_list_id` is set | ClickUp space name or space ID |
+| `clickup_list_id` | No | List ID. When set, the workflow uses this list and does not look up the space |
+
+Set `clickup_space` on each repository. The name match is case-insensitive. The token's workspaces are searched until a space matches.
+
+The workflow then looks for a list named `Dependency Updates` in that space and creates it when it is missing. Override the list name with the `list-name` input.
+
+If `clickup_space` is set but no space matches, the job fails. If neither property is set, the job exits successfully and logs a notice.
+
+### 3. Add the ClickUp token
+
+Store a ClickUp personal API token (`pk_...`) as the Actions secret `CLICKUP_API_TOKEN`. An organization secret lets every caller use the same token.
+
+The token needs access to the destination workspace, including permission to create lists and tasks.
+
+### What gets created
+
+Tasks are named `[owner/repo#123] PR title`, so a later event can find the same task. The description includes the pull request link, title, branch, and labels, and the default tag is `renovate`.
+
+On close, a merged pull request is commented as merged by the merging user. A pull request closed without merging is commented as superseded or abandoned. The task then moves to the list's closed or done status. Reopening the pull request moves the task back to the list's open status.
+
+### Inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `list-name` | List to find or create in the repository's space | No | `Dependency Updates` |
+| `bot-login` | Pull request author to track | No | `renovate[bot]` |
+| `tags` | Comma-separated ClickUp tags for new tasks | No | `renovate` |
+| `priority` | ClickUp priority: `1` urgent, `2` high, `3` normal, `4` low. Empty sets none | No | empty |
+
+### Example with custom inputs
+
+```yaml
+jobs:
+  sync:
+    uses: dev-hero/reusable-wp-deploy/.github/workflows/reusable-renovate-clickup.yml@v1
+    with:
+      list-name: Renovate
+      tags: renovate, dependencies
+      priority: '3'
+    secrets:
+      CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+```
+
+### Renovate → ClickUp troubleshooting
+
+- **Nothing was created.** Confirm the pull request author is `renovate[bot]` (or whatever `bot-login` is set to), and that the repository has `clickup_space` or `clickup_list_id`.
+- **Job failed looking up the space.** The token cannot see a space with that name or ID. Check the property value and the token's workspace access.
+- **Task did not reopen or close.** The destination list needs a status of type open, and a status of type closed or done. The close comment is still posted when a status is missing.
 
 ## Contributing
 
