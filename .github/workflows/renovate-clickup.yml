@@ -9,9 +9,14 @@ name: Renovate → ClickUp
 # icon, colored orange. Optional property "clickup_list_id"
 # overrides the list for odd cases. Repos with neither property are skipped.
 #
-#   opened / reopened  -> create the task (or reopen it)
+# One task per update, keyed by repo and PR title, so the PRs Renovate opens
+# for the same update into develop, staging, and main share a task.
+#
+#   opened / reopened  -> create the task, or reuse (and reopen) it
 #   edited (title)     -> rename the task
-#   closed             -> comment merged/closed and close the task
+#   closed             -> merged into the final branch, or closed unmerged:
+#                         comment and close. Merged into any other branch:
+#                         comment and leave open.
 
 on:
   workflow_call:
@@ -36,6 +41,11 @@ on:
         required: false
         type: string
         default: ""
+      final-branch:
+        description: Branch whose merge closes the task. Empty uses the repository's default branch
+        required: false
+        type: string
+        default: ""
     secrets:
       CLICKUP_API_TOKEN:
         description: ClickUp personal API token (pk_...)
@@ -50,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
-      group: renovate-clickup-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: renovate-clickup-${{ github.repository }}-${{ github.event.pull_request.head.ref }}
       cancel-in-progress: false
     steps:
       - name: Sync PR to ClickUp
@@ -64,19 +74,21 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          OLD_TITLE: ${{ github.event.changes.title.from }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           PR_BASE: ${{ github.event.pull_request.base.ref }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ', ') }}
           MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+          FINAL_BRANCH: ${{ inputs.final-branch || github.event.repository.default_branch }}
         shell: bash
         run: |
           set -euo pipefail
           API="${CLICKUP_API_BASE:-https://api.clickup.com/api/v2}"
           GH_API="${GITHUB_API_URL:-https://api.github.com}"
-          MARKER="[${REPO}#${PR_NUMBER}]"
-          NAME="${MARKER} ${PR_TITLE}"
+          NAME="[${REPO}] ${PR_TITLE}"
+          PR_REF="${REPO}#${PR_NUMBER}"
 
           cu() { # cu METHOD PATH [JSON]
             local args=(-fsS --retry 3 -X "$1" -H "Authorization: ${CLICKUP_TOKEN}" -H "Content-Type: application/json")
@@ -118,29 +130,42 @@ jobs:
           echo "Using ClickUp list ${LIST_ID}"
 
           # --- 2. Sync the task ---
+          # Prints "<id> <status type>" for the task named "[repo] <title>", or a
+          # task from before per-update naming: "[repo#<number>] <title>".
           find_task() {
-            local page=0 resp id
+            local title="$1" page=0 resp hit
             while :; do
               resp=$(cu GET "/list/${LIST_ID}/task?include_closed=true&subtasks=true&archived=false&page=${page}")
-              id=$(jq -r --arg m "$MARKER" '[.tasks[] | select(.name | startswith($m)) | .id][0] // empty' <<<"$resp")
-              if [ -n "$id" ]; then echo "$id"; return; fi
+              hit=$(jq -r --arg name "[${REPO}] ${title}" --arg pre "[${REPO}#" --arg suf "] ${title}" '
+                [.tasks[] | select(.name == $name or ((.name | startswith($pre)) and (.name | endswith($suf))))
+                 | "\(.id) \(.status.type // "")"][0] // empty' <<<"$resp")
+              if [ -n "$hit" ]; then echo "$hit"; return; fi
               if [ "$(jq -r '.last_page // false' <<<"$resp")" = "true" ] || [ "$(jq '.tasks | length' <<<"$resp")" = "0" ]; then return; fi
               page=$((page + 1))
             done
+          }
+
+          comment() {
+            cu POST "/task/${TASK_ID}/comment" "$(jq -n --arg t "$1" '{comment_text: $t, notify_all: false}')" >/dev/null
           }
 
           statuses=$(cu GET "/list/${LIST_ID}" | jq '.statuses')
           OPEN_STATUS=$(jq -r '[.[] | select(.type == "open")][0].status // empty' <<<"$statuses")
           CLOSED_STATUS=$(jq -r '([.[] | select(.type == "closed")] + [.[] | select(.type == "done")])[0].status // empty' <<<"$statuses")
 
-          TASK_ID=$(find_task)
+          found=$(find_task "$PR_TITLE")
+          if [ -z "$found" ] && [ "$ACTION" = "edited" ] && [ -n "$OLD_TITLE" ]; then
+            found=$(find_task "$OLD_TITLE")
+          fi
+          TASK_ID="${found%% *}"
+          TASK_STATE="${found#* }"
 
           case "$ACTION" in
             opened|reopened|edited)
               if [ -z "$TASK_ID" ]; then
                 # shellcheck disable=SC2016 # backticks are literal markdown
-                desc=$(printf '**Renovate PR:** [%s#%s](%s)\n\n- **Title:** %s\n- **Branch:** `%s` → `%s`\n- **Labels:** %s\n\n_Created automatically by the Renovate → ClickUp workflow. Closes automatically when the PR is merged or closed._' \
-                  "$REPO" "$PR_NUMBER" "$PR_URL" "$PR_TITLE" "$PR_BRANCH" "$PR_BASE" "${PR_LABELS:-none}")
+                desc=$(printf '**Renovate PR:** [%s](%s)\n\n- **Title:** %s\n- **Branch:** `%s` → `%s`\n- **Labels:** %s\n\n_Created automatically by the Renovate → ClickUp workflow. Later PRs for the same update into other branches are added as comments. Closes when the update is merged into `%s`, or a PR is closed without merging._' \
+                  "$PR_REF" "$PR_URL" "$PR_TITLE" "$PR_BRANCH" "$PR_BASE" "${PR_LABELS:-none}" "$FINAL_BRANCH")
                 body=$(jq -n --arg name "$NAME" --arg desc "$desc" --arg tags "$TAGS" --arg prio "$PRIORITY" '
                   {name: $name, markdown_description: $desc,
                    tags: ($tags | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))}
@@ -148,23 +173,34 @@ jobs:
                 TASK_ID=$(cu POST "/list/${LIST_ID}/task" "$body" | jq -r '.id')
                 echo "Created ClickUp task ${TASK_ID}"
               else
-                upd=$(jq -n --arg name "$NAME" --arg st "$OPEN_STATUS" --arg action "$ACTION" '
-                  {name: $name} + (if $action == "reopened" and $st != "" then {status: $st} else {} end)')
+                reopen=false
+                if [ "$ACTION" != "edited" ] && [ -n "$OPEN_STATUS" ] && { [ "$TASK_STATE" = "closed" ] || [ "$TASK_STATE" = "done" ]; }; then
+                  reopen=true
+                fi
+                upd=$(jq -n --arg name "$NAME" --arg st "$OPEN_STATUS" --argjson reopen "$reopen" '
+                  {name: $name} + (if $reopen then {status: $st} else {} end)')
                 cu PUT "/task/${TASK_ID}" "$upd" >/dev/null
-                echo "Updated ClickUp task ${TASK_ID}"
+                if [ "$ACTION" != "edited" ]; then
+                  comment "PR ${PR_REF} ${ACTION} into ${PR_BASE}: ${PR_URL}"
+                fi
+                echo "Updated ClickUp task ${TASK_ID}$([ "$reopen" = true ] && echo " (reopened)")"
               fi
               ;;
             closed)
               if [ -z "$TASK_ID" ]; then
-                echo "No ClickUp task for ${MARKER}; nothing to close."
+                echo "No ClickUp task for ${NAME}; nothing to close."
+                exit 0
+              fi
+              if [ "$PR_MERGED" = "true" ] && [ "$PR_BASE" != "$FINAL_BRANCH" ]; then
+                comment "PR ${PR_REF} merged into ${PR_BASE} by @${MERGED_BY}: ${PR_URL}. Stays open until merged into ${FINAL_BRANCH}."
+                echo "Left ClickUp task ${TASK_ID} open (merged into ${PR_BASE}, waiting for ${FINAL_BRANCH})"
                 exit 0
               fi
               if [ "$PR_MERGED" = "true" ]; then
-                note="PR merged by @${MERGED_BY}: ${PR_URL}"
+                comment "PR ${PR_REF} merged into ${PR_BASE} by @${MERGED_BY}: ${PR_URL}"
               else
-                note="PR closed without merging (superseded or abandoned): ${PR_URL}"
+                comment "PR ${PR_REF} closed without merging (superseded or abandoned): ${PR_URL}"
               fi
-              cu POST "/task/${TASK_ID}/comment" "$(jq -n --arg t "$note" '{comment_text: $t, notify_all: false}')" >/dev/null
               if [ -n "$CLOSED_STATUS" ]; then
                 cu PUT "/task/${TASK_ID}" "$(jq -n --arg st "$CLOSED_STATUS" '{status: $st}')" >/dev/null
               fi

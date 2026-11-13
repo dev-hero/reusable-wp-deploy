@@ -459,14 +459,20 @@ jobs:
 
 Reusable workflow: [`.github/workflows/renovate-clickup.yml`](.github/workflows/renovate-clickup.yml).
 
-Mirrors Mend Renovate pull requests into ClickUp. ClickUp IDs stay out of every repository. Each repo is routed with an organization custom property, and the workflow finds or creates a **Dependency Updates** list in that space.
+Mirrors Mend Renovate pull requests into ClickUp, with one task per dependency update. ClickUp IDs stay out of every repository. Each repo is routed with an organization custom property, and the workflow finds or creates a **Dependency Updates** list in that space.
+
+An update often gets several pull requests. Renovate opens each one against the default branch. When one is retargeted to `develop` or `staging` and merged, Renovate opens a new pull request for the same update against the default branch. All of those pull requests share one task, which stays open until the update is merged into the final branch.
 
 | Pull request event | ClickUp result |
 |--------------------|----------------|
-| `opened` | Create a task |
-| `reopened` | Reopen the existing task, or create it if it is missing |
+| `opened` | Create the task. If the update already has one, comment with the new pull request and reopen the task if it was closed |
+| `reopened` | Same as `opened` |
 | `edited` (title only) | Rename the task |
-| `closed` | Comment whether the PR was merged or closed, then close the task |
+| `closed`, merged into the final branch | Comment that it was merged, then close the task |
+| `closed`, merged into any other branch | Comment that it was merged there, and leave the task open |
+| `closed` without merging | Comment that it was closed, then close the task |
+
+The final branch is the repository's default branch unless the `final-branch` input says otherwise.
 
 Pull requests from any author other than `renovate[bot]` are ignored. Edits that do not change the title are ignored. A repository with neither custom property below is skipped.
 
@@ -513,9 +519,11 @@ The token needs access to the destination workspace, including permission to cre
 
 ### What gets created
 
-Tasks are named `[owner/repo#123] PR title`, so a later event can find the same task. The description includes the pull request link, title, branch, and labels, and the default tag is `renovate`.
+Tasks are named `[owner/repo] PR title`. Later events find the task by that name, so every pull request with the same title in the same repository shares it. Renovate puts the target version in the title, so a newer version of the same dependency gets its own task. When Renovate changes the title of an open pull request, the task is renamed with it.
 
-On close, a merged pull request is commented as merged by the merging user. A pull request closed without merging is commented as superseded or abandoned. The task then moves to the list's closed or done status. Reopening the pull request moves the task back to the list's open status.
+Tasks created before this naming are named `[owner/repo#123] PR title`. Those are still found by their title and are renamed to the new format on their next event.
+
+The description comes from the first pull request: its link, title, branch, and labels. The default tag is `renovate`. Each later pull request and every merge or close is added as a comment that names the pull request and its target branch. Closing moves the task to the list's closed or done status. Reopening moves it back to the list's open status.
 
 ### Inputs
 
@@ -525,6 +533,7 @@ On close, a merged pull request is commented as merged by the merging user. A pu
 | `bot-login` | Pull request author to track | No | `renovate[bot]` |
 | `tags` | Comma-separated ClickUp tags for new tasks | No | `renovate` |
 | `priority` | ClickUp priority: `1` urgent, `2` high, `3` normal, `4` low. Empty sets none | No | empty |
+| `final-branch` | Branch whose merge closes the task. Empty uses the repository's default branch | No | empty |
 
 ### Example with custom inputs
 
@@ -545,6 +554,8 @@ jobs:
 - **Nothing was created.** Confirm the pull request author is `renovate[bot]` (or whatever `bot-login` is set to), and that the repository has `clickup_space` or `clickup_list_id`.
 - **Job failed looking up the space.** The token cannot see a space with that name or ID. Check the property value and the token's workspace access.
 - **Task did not reopen or close.** The destination list needs a status of type open, and a status of type closed or done. The close comment is still posted when a status is missing.
+- **Task stayed open after a merge.** The pull request was merged into a branch other than the final branch. Check the task's comments for the target branch, and set `final-branch` if updates finish somewhere other than the default branch.
+- **Two tasks for one update.** The pull requests had different titles, for example after Renovate moved an open pull request to a newer version and an older pull request had already closed. Tasks are matched by title, so close the older one by hand.
 
 ## Versioning
 
